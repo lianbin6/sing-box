@@ -133,31 +133,6 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		m.logger.ErrorContext(ctx, err)
 		return
 	}
-	if len(metadata.TCPPrefix) > 0 {
-		writeContext, cancel := context.WithTimeout(ctx, C.TCPTimeout)
-		writeClosed := make(chan struct{})
-		stop := context.AfterFunc(writeContext, func() {
-			remoteConn.Close()
-			close(writeClosed)
-		})
-		var n int
-		n, err = remoteConn.Write(metadata.TCPPrefix)
-		if !stop() {
-			<-writeClosed
-			err = writeContext.Err()
-		}
-		cancel()
-		if err == nil && n < len(metadata.TCPPrefix) {
-			err = io.ErrShortWrite
-		}
-		if err != nil {
-			err = E.Cause(err, "write TCP prefix")
-			remoteConn.Close()
-			N.CloseOnHandshakeFailure(conn, onClose, err)
-			m.logger.ErrorContext(ctx, err)
-			return
-		}
-	}
 	err = N.ReportConnHandshakeSuccess(conn, remoteConn)
 	if err != nil {
 		err = E.Cause(err, "report handshake success")
@@ -166,7 +141,10 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		m.logger.ErrorContext(ctx, err)
 		return
 	}
-	if !metadata.TLSFragment && !metadata.TLSRecordFragment && metadata.TLSSpoof == "" {
+	if len(metadata.TCPPrefix) > 0 {
+		remoteConn = &prefixConn{Conn: remoteConn, prefix: metadata.TCPPrefix}
+	}
+	if !metadata.TLSFragment && !metadata.TLSRecordFragment && metadata.TLSSpoof == "" && len(metadata.TCPPrefix) == 0 {
 		var spliced bool
 		spliced, err = m.spliceConnection(ctx, conn, remoteConn, onClose)
 		if err != nil {
@@ -195,10 +173,10 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	}
 	serverFirst := sniff.Skip(&metadata)
 	var done atomic.Bool
-	if m.kickWriteHandshake(ctx, conn, remoteConn, serverFirst, false, &done, onClose) {
+	if m.kickWriteHandshake(ctx, conn, remoteConn, serverFirst, len(metadata.TCPPrefix) > 0, false, &done, onClose) {
 		return
 	}
-	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
+	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, false, true, &done, onClose) {
 		return
 	}
 	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
@@ -372,7 +350,7 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 	}
 }
 
-func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.Conn, destination net.Conn, serverFirst bool, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) bool {
+func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.Conn, destination net.Conn, serverFirst bool, writePrefix bool, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) bool {
 	if !N.NeedHandshakeForWrite(destination) {
 		return false
 	}
@@ -380,8 +358,13 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 		err          error
 		wrotePayload bool
 	)
+	handshakeTimeout := C.ReadPayloadTimeout
+	if writePrefix {
+		wrotePayload = true
+		handshakeTimeout = C.TCPTimeout
+	}
 	if serverFirst {
-		_ = destination.SetWriteDeadline(time.Now().Add(C.ReadPayloadTimeout))
+		_ = destination.SetWriteDeadline(time.Now().Add(handshakeTimeout))
 		_, err = destination.Write(nil)
 		_ = destination.SetWriteDeadline(time.Time{})
 	} else {
@@ -405,7 +388,7 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 				}
 			}
 		} else {
-			_ = destination.SetWriteDeadline(time.Now().Add(C.ReadPayloadTimeout))
+			_ = destination.SetWriteDeadline(time.Now().Add(handshakeTimeout))
 			_, err = destinationWriter.Write(nil)
 			_ = destination.SetWriteDeadline(time.Time{})
 		}
@@ -491,6 +474,41 @@ func (o *socketOwner) close() bool {
 	}
 	owner.Close()
 	return true
+}
+
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *prefixConn) Write(b []byte) (int, error) {
+	if len(c.prefix) == 0 {
+		return c.Conn.Write(b)
+	}
+	prefixLen := len(c.prefix)
+	buffer := buf.NewSize(prefixLen + len(b))
+	defer buffer.Release()
+	common.Must1(buffer.Write(c.prefix))
+	common.Must1(buffer.Write(b))
+	n, err := c.Conn.Write(buffer.Bytes())
+	c.prefix = c.prefix[min(n, prefixLen):]
+	return max(n-prefixLen, 0), err
+}
+
+func (c *prefixConn) NeedHandshakeForWrite() bool {
+	return len(c.prefix) > 0
+}
+
+func (c *prefixConn) ReaderReplaceable() bool {
+	return true
+}
+
+func (c *prefixConn) WriterReplaceable() bool {
+	return len(c.prefix) == 0
+}
+
+func (c *prefixConn) Upstream() any {
+	return c.Conn
 }
 
 type trackedConn struct {
@@ -580,6 +598,9 @@ func (c *trackedPacketConn) WriterReplaceable() bool {
 }
 
 var (
-	_ tun.SpliceSocket = (*trackedConn)(nil)
-	_ tun.SpliceSocket = (*trackedPacketConn)(nil)
+	_ tun.SpliceSocket     = (*trackedConn)(nil)
+	_ tun.SpliceSocket     = (*trackedPacketConn)(nil)
+	_ N.EarlyWriter        = (*prefixConn)(nil)
+	_ N.ReaderWithUpstream = (*prefixConn)(nil)
+	_ N.WriterWithUpstream = (*prefixConn)(nil)
 )
