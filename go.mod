@@ -52,7 +52,7 @@ require (
 	github.com/sagernet/sing-quic v0.7.2-0.20261124143824-14ca3448d44b
 	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e
 	github.com/sagernet/sing-shadowsocks2 v0.2.2-0.20261110092058-52ade8ab7e95
-	github.com/sagernet/sing-shadowtls v0.2.2-0.20261114073233-97863830a3b3
+	github.com/sagernet/sing-shadowtls v0.2.2-0.20261124075649-a054b440e435
 	github.com/sagernet/sing-snell v0.0.0-20261110094602-04667b0a321c
 	github.com/sagernet/sing-tun v0.9.7-0.20261124071936-e6de6ac90099
 	github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca
